@@ -76,6 +76,20 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    # only used to return cached tokens when --enable-cache-report is set
+    prompt_tokens_details: Optional[Dict[str, int]] = None
+
+
+class StreamOptions(BaseModel):
+    include_usage: Optional[bool] = False
+
+
+class JsonSchemaResponseFormat(BaseModel):
+    name: str
+    description: Optional[str] = None
+    # use alias to workaround pydantic conflict
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    strict: Optional[bool] = False
 
 
 class FileRequest(BaseModel):
@@ -149,6 +163,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
@@ -156,7 +171,12 @@ class CompletionRequest(BaseModel):
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
-    ignore_eos: Optional[bool] = False
+    json_schema: Optional[str] = None
+    ignore_eos: bool = False
+    min_tokens: int = 0
+    repetition_penalty: Optional[float] = 1.0
+    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    no_stop_trim: Union[bool, List[bool]] = False
 
 
 class CompletionResponseChoice(BaseModel):
@@ -164,6 +184,7 @@ class CompletionResponseChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionResponse(BaseModel):
@@ -180,6 +201,7 @@ class CompletionResponseStreamChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -188,12 +210,7 @@ class CompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[CompletionResponseStreamChoice]
-    usage: UsageInfo
-
-
-class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant"]
-    content: str
+    usage: Optional[UsageInfo] = None
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -209,11 +226,17 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
+    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
 ]
+
+
+class ChatCompletionMessageGenericParam(BaseModel):
+    role: Literal["system", "assistant"]
+    content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -227,8 +250,8 @@ ChatCompletionMessageParam = Union[
 
 
 class ResponseFormat(BaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -247,12 +270,17 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
+    min_tokens: Optional[int] = 0
+    repetition_penalty: Optional[float] = 1.0
+    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    ignore_eos: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -265,6 +293,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: str
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -286,6 +315,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -294,3 +324,27 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = None
+
+
+class EmbeddingRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    input: Union[List[int], List[List[int]], str, List[str]]
+    model: str
+    encoding_format: str = "float"
+    dimensions: int = None
+    user: Optional[str] = None
+
+
+class EmbeddingObject(BaseModel):
+    embedding: List[float]
+    index: int
+    object: str = "embedding"
+
+
+class EmbeddingResponse(BaseModel):
+    data: List[EmbeddingObject]
+    model: str
+    object: str = "list"
+    usage: Optional[UsageInfo] = None

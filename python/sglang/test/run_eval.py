@@ -16,6 +16,8 @@ from sglang.test.simple_eval_common import (
 
 
 def run_eval(args):
+    set_ulimit()
+
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
@@ -39,6 +41,14 @@ def run_eval(args):
         eval_obj = MathEval(
             filename, equality_checker, args.num_examples, args.num_threads
         )
+    elif args.eval_name == "mgsm":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "mgsm_en":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
@@ -57,6 +67,7 @@ def run_eval(args):
         model=args.model,
         max_tokens=2048,
         base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
     )
 
     # Run eval
@@ -109,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    set_ulimit()
+    parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
 
     run_eval(args)

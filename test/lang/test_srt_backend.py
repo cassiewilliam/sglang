@@ -1,12 +1,14 @@
-import json
 import unittest
 
 import sglang as sgl
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,
+    test_dtype_gen,
     test_expert_answer,
     test_few_shot_qa,
+    test_gen_min_new_tokens,
+    test_hellaswag_select,
     test_mt_bench,
     test_parallel_decoding,
     test_regex,
@@ -59,14 +61,18 @@ class TestSRTBackend(unittest.TestCase):
     def test_regex(self):
         test_regex()
 
+    def test_dtype_gen(self):
+        test_dtype_gen()
+
+    def test_hellaswag_select(self):
+        # Run twice to capture more bugs
+        for _ in range(2):
+            accuracy, latency = test_hellaswag_select()
+            assert accuracy > 0.71, f"{accuracy=}"
+
+    def test_gen_min_new_tokens(self):
+        test_gen_min_new_tokens()
+
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestSRTBackend()
-    # t.setUpClass()
-    # t.test_few_shot_qa()
-    # t.tearDownClass()
+    unittest.main()

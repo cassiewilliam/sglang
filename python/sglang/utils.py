@@ -1,21 +1,26 @@
 """Common utilities."""
 
 import base64
+import gc
 import importlib
 import json
 import logging
+import os
 import signal
+import subprocess
 import sys
-import threading
+import time
 import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import requests
+from IPython.display import HTML, display
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +42,11 @@ def is_same_type(values: list):
 
 def read_jsonl(filename: str):
     """Read a JSONL file."""
-    rets = []
     with open(filename) as fin:
         for line in fin:
             if line.startswith("#"):
                 continue
-            rets.append(json.loads(line))
-    return rets
+            yield json.loads(line)
 
 
 def dump_state_text(filename: str, states: list, mode: str = "w"):
@@ -152,7 +155,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
     frames = []
-    for i in range(total_frames):
+    for _ in range(total_frames):
         ret, frame = cap.read()
         if ret:
             frames.append(frame)
@@ -261,3 +264,95 @@ class LazyImport:
     def __call__(self, *args, **kwargs):
         module = self._load()
         return module(*args, **kwargs)
+
+
+def download_and_cache_file(url: str, filename: Optional[str] = None):
+    """Read and cache a file from a url."""
+    if filename is None:
+        filename = os.path.join("/tmp", url.split("/")[-1])
+
+    # Check if the cache file already exists
+    if os.path.exists(filename):
+        return filename
+
+    print(f"Downloading from {url} to {filename}")
+
+    # Stream the response to show the progress bar
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Check for request errors
+
+    # Total size of the file in bytes
+    total_size = int(response.headers.get("content-length", 0))
+    chunk_size = 1024  # Download in chunks of 1KB
+
+    # Use tqdm to display the progress bar
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+    return filename
+
+
+def execute_shell_command(command: str) -> subprocess.Popen:
+    """
+    Execute a shell command and return the process handle
+
+    Args:
+        command: Shell command as a string (can include \\ line continuations)
+    Returns:
+        subprocess.Popen: Process handle
+    """
+    # Replace \ newline with space and split
+    command = command.replace("\\\n", " ").replace("\\", " ")
+    parts = command.split()
+
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+
+
+def wait_for_server(base_url: str, timeout: int = None) -> None:
+    """Wait for the server to be ready by polling the /v1/models endpoint.
+
+    Args:
+        base_url: The base URL of the server
+        timeout: Maximum time to wait in seconds. None means wait forever.
+    """
+    start_time = time.time()
+    while True:
+        try:
+            response = requests.get(
+                f"{base_url}/v1/models",
+                headers={"Authorization": "Bearer None"},
+            )
+            if response.status_code == 200:
+                time.sleep(5)
+                print_highlight(
+                    """\n
+                    NOTE: Typically, the server runs in a separate terminal.
+                    In this notebook, we run the server and notebook code together, so their outputs are combined.
+                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    """
+                )
+                break
+
+            if timeout and time.time() - start_time > timeout:
+                raise TimeoutError("Server did not become ready within timeout period")
+        except requests.exceptions.RequestException:
+            time.sleep(1)
+
+
+def terminate_process(process):
+    from sglang.srt.utils import kill_child_process
+
+    kill_child_process(process.pid, include_self=True)
+
+
+def print_highlight(html_content: str):
+    html_content = str(html_content).replace("\n", "<br>")
+    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))

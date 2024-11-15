@@ -2,25 +2,19 @@
 
 """
 HumanEval: Evaluating Large Language Models Trained on Code
-Mark Chen and Jerry Tworek and Heewoo Jun and Qiming Yuan and Henrique Ponde de Oliveira Pinto and Jared Kaplan and Harri Edwards and Yuri Burda and Nicholas Joseph and Greg Brockman and Alex Ray and Raul Puri and Gretchen Krueger and Michael Petrov and Heidy Khlaaf and Girish Sastry and Pamela Mishkin and Brooke Chan and Scott Gray and Nick Ryder and Mikhail Pavlov and Alethea Power and Lukasz Kaiser and Mohammad Bavarian and Clemens Winter and Philippe Tillet and Felipe Petroski Such and Dave Cummings and Matthias Plappert and Fotios Chantzis and Elizabeth Barnes and Ariel Herbert-Voss and William Hebgen Guss and Alex Nichol and Alex Paino and Nikolas Tezak and Jie Tang and Igor Babuschkin and Suchir Balaji and Shantanu Jain and William Saunders and Christopher Hesse and Andrew N. Carr and Jan Leike and Josh Achiam and Vedant Misra and Evan Morikawa and Alec Radford and Matthew Knight and Miles Brundage and Mira Murati and Katie Mayer and Peter Welinder and Bob McGrew and Dario Amodei and Sam McCandlish and Ilya Sutskever and Wojciech Zaremba 
-https://arxiv.org/abs/2107.03374 https://github.com/openai/human-eval/ 
+Mark Chen and Jerry Tworek and Heewoo Jun and Qiming Yuan and Henrique Ponde de Oliveira Pinto and Jared Kaplan and Harri Edwards and Yuri Burda and Nicholas Joseph and Greg Brockman and Alex Ray and Raul Puri and Gretchen Krueger and Michael Petrov and Heidy Khlaaf and Girish Sastry and Pamela Mishkin and Brooke Chan and Scott Gray and Nick Ryder and Mikhail Pavlov and Alethea Power and Lukasz Kaiser and Mohammad Bavarian and Clemens Winter and Philippe Tillet and Felipe Petroski Such and Dave Cummings and Matthias Plappert and Fotios Chantzis and Elizabeth Barnes and Ariel Herbert-Voss and William Hebgen Guss and Alex Nichol and Alex Paino and Nikolas Tezak and Jie Tang and Igor Babuschkin and Suchir Balaji and Shantanu Jain and William Saunders and Christopher Hesse and Andrew N. Carr and Jan Leike and Josh Achiam and Vedant Misra and Evan Morikawa and Alec Radford and Matthew Knight and Miles Brundage and Mira Murati and Katie Mayer and Peter Welinder and Bob McGrew and Dario Amodei and Sam McCandlish and Ilya Sutskever and Wojciech Zaremba
+https://arxiv.org/abs/2107.03374 https://github.com/openai/human-eval/
 """
 
-import json
-import logging
-import multiprocessing
 import random
 import re
-from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Optional
 
-import blobfile as bf
 import tqdm
 
 try:
-    from human_eval.data import HUMAN_EVAL, read_problems
+    from human_eval.data import read_problems
     from human_eval.evaluation import estimate_pass_at_k
     from human_eval.execution import check_correctness  # , unsafe_execute
 except (ImportError, ModuleNotFoundError):
@@ -67,7 +61,7 @@ def evaluate_functional_correctness(
 class HumanEval(Eval):
     def __init__(
         self,
-        num_examples: int | None,
+        num_examples: Optional[int],
         num_threads: int,
         num_samples_per_task: int = 5,
         ks_passes: List[int] = [1, 2, 5],

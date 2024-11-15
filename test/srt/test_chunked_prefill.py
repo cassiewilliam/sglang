@@ -1,45 +1,51 @@
+"""
+python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
+"""
+
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    run_bench_serving,
+    run_mmlu_test,
+    run_mulit_request_test,
+)
 
 
-class TestAccuracy(unittest.TestCase):
+class TestChunkedPrefill(unittest.TestCase):
+    def test_chunked_prefill(self):
+        run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=False)
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = f"http://localhost:8157"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=300,
-            other_args=["--chunked-prefill-size", "32"],
+    def test_mixed_chunked_prefill(self):
+        run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
+
+    def test_chunked_prefill_without_radix_cache(self):
+        run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=False)
+
+    def test_mixed_chunked_prefill_without_radix_cache(self):
+        run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=True)
+
+    def test_no_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=False, enable_mixed_chunk=False, chunked_prefill_size=-1
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=20,
-            num_threads=20,
+    def test_no_chunked_prefill_without_radix_cache(self):
+        res = run_bench_serving(
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            num_prompts=10,
+            request_rate=float("inf"),
+            other_server_args=["--disable-radix-cache", "--chunked-prefill-size", "-1"],
         )
 
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        assert res["completed"] == 10
+
+    def test_mixed_chunked_prefill_multi_requests(self):
+        run_mulit_request_test(
+            enable_mixed_chunk=True,
+            chunked_prefill_size=2048,
+        )
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestAccuracy()
-    # t.setUpClass()
-    # t.test_mmlu()
-    # t.tearDownClass()
+    unittest.main()

@@ -2,7 +2,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
 """
-Benchmark online serving.
+Benchmark online serving with dynamic requests.
 
 Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
@@ -24,7 +24,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import AsyncGenerator, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -39,6 +39,8 @@ from transformers import (
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+global args
+
 
 @dataclass
 class RequestFuncInput:
@@ -47,6 +49,7 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
+    extra_request_body: Dict[str, Any]
 
 
 @dataclass
@@ -84,6 +87,7 @@ async def async_request_trt_llm(
             "stream": True,
             "min_length": request_func_input.output_len,
             "end_id": 1048576,
+            **request_func_input.extra_request_body,
         }
         if args.disable_ignore_eos:
             del payload["min_length"]
@@ -145,15 +149,18 @@ async def async_request_openai_completions(
         "completions"
     ), "OpenAI Completions API URL must end with 'completions'."
 
+    prompt = request_func_input.prompt
+
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "model": request_func_input.model,
-            "prompt": request_func_input.prompt,
+            "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
+            **request_func_input.extra_request_body,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
@@ -192,7 +199,8 @@ async def async_request_openai_completions(
                                     output.ttft = ttft
 
                                 # Decoding phase
-                                output.itl.append(timestamp - most_recent_timestamp)
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
@@ -214,6 +222,171 @@ async def async_request_openai_completions(
     return output
 
 
+async def async_request_truss(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+
+    prompt = request_func_input.prompt
+
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "model": request_func_input.model,
+            "prompt": prompt,
+            "temperature": 0.0,
+            "best_of": 1,
+            "max_tokens": request_func_input.output_len,
+            "stream": not args.disable_stream,
+            "ignore_eos": not args.disable_ignore_eos,
+            **request_func_input.extra_request_body,
+        }
+        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            # NOTE: Some completion API might have a last
+                            # usage summary response without a token so we
+                            # want to check a token was generated
+                            if data["choices"][0]["delta"]["content"]:
+                                timestamp = time.perf_counter()
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = time.perf_counter() - st
+                                    output.ttft = ttft
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text += data["choices"][0]["delta"]["content"]
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                    output.output_len = request_func_input.output_len
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_sglang_generate(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    prompt = request_func_input.prompt
+
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "text": prompt,
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": request_func_input.output_len,
+                "ignore_eos": not args.disable_ignore_eos,
+            },
+            "stream": not args.disable_stream,
+            **request_func_input.extra_request_body,
+        }
+        headers = {}
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+                        # print(chunk_bytes)
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            # NOTE: Some completion API might have a last
+                            # usage summary response without a token so we
+                            # want to check a token was generated
+                            if data["text"]:
+                                timestamp = time.perf_counter()
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = time.perf_counter() - st
+                                    output.ttft = ttft
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text = data["text"]
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                    output.output_len = request_func_input.output_len
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_gserver(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    raise NotImplementedError()
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
         import huggingface_hub.constants
@@ -232,6 +405,13 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+
+        return get_tokenizer(pretrained_model_name_or_path)
+
     if pretrained_model_name_or_path is not None and not os.path.exists(
         pretrained_model_name_or_path
     ):
@@ -242,10 +422,14 @@ def get_tokenizer(
 
 
 ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_openai_completions,
+    "sglang": async_request_sglang_generate,
+    "sglang-native": async_request_sglang_generate,
+    "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
     "trt": async_request_trt_llm,
+    "gserver": async_request_gserver,
+    "truss": async_request_truss,
 }
 
 
@@ -275,34 +459,41 @@ class BenchmarkMetrics:
     median_e2e_latency_ms: float
 
 
-default_sharegpt_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
-def download_sharegpt_dataset(path):
-    url = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+def download_and_cache_file(url: str, filename: Optional[str] = None):
+    """Read and cache a file from a url."""
+    if filename is None:
+        filename = os.path.join("/tmp", url.split("/")[-1])
 
-    print(f"Downloading dataset from {url}")
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
+    # Check if the cache file already exists
+    if os.path.exists(filename):
+        return filename
 
-        total_size = int(response.headers.get("content-length", 0))
-        block_size = 8192
+    print(f"Downloading from {url} to {filename}")
 
-        with open(path, "wb") as f, tqdm(
-            desc="Downloading",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress_bar:
-            for data in response.iter_content(block_size):
-                size = f.write(data)
-                progress_bar.update(size)
+    # Stream the response to show the progress bar
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Check for request errors
 
-        print(f"Dataset downloaded and saved to {path}")
-    except requests.RequestException as e:
-        raise Exception(f"Failed to download dataset: {e}")
+    # Total size of the file in bytes
+    total_size = int(response.headers.get("content-length", 0))
+    chunk_size = 1024  # Download in chunks of 1KB
+
+    # Use tqdm to display the progress bar
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+    return filename
 
 
 def sample_sharegpt_requests(
@@ -315,13 +506,8 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path) and not os.path.isfile(default_sharegpt_path):
-        download_sharegpt_dataset(default_sharegpt_path)
-        dataset_path = default_sharegpt_path
-    else:
-        dataset_path = (
-            dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
-        )
+    if not os.path.isfile(dataset_path):
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -345,9 +531,9 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
-        prompt_token_ids = tokenizer(prompt).input_ids
+        prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
-        completion_token_ids = tokenizer(completion).input_ids
+        completion_token_ids = tokenizer.encode(completion)
         prompt_len = len(prompt_token_ids)
         output_len = (
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
@@ -355,11 +541,15 @@ def sample_sharegpt_requests(
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > 1024 or (
+            prompt_len + output_len > 2048 and fixed_output_len is None
+        ):
             # Prune too long sequences.
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
 
+    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
     return filtered_dataset
 
 
@@ -387,15 +577,8 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path) and not os.path.isfile(
-            default_sharegpt_path
-        ):
-            download_sharegpt_dataset(default_sharegpt_path)
-            dataset_path = default_sharegpt_path
-        else:
-            dataset_path = (
-                dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
-            )
+        if not os.path.isfile(dataset_path):
+            dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -413,11 +596,19 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[Tuple[str, int, int]] = []
-        for i in range(num_prompts):
+        for data in dataset:
+            i = len(input_requests)
+            if i == num_prompts:
+                break
+
             # Tokenize the prompts and completions.
-            prompt = dataset[i][0]
-            prompt_token_ids = tokenizer(prompt).input_ids
+            prompt = data[0]
+            prompt_token_ids = tokenizer.encode(prompt)
             prompt_len = len(prompt_token_ids)
+
+            # Skip empty prompt
+            if prompt_len == 0:
+                continue
 
             if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
@@ -441,6 +632,66 @@ def sample_random_requests(
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
+
+def gen_prompt(tokenizer, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def sample_generated_shared_prefix_requests(
+    num_groups: int,
+    prompts_per_group: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int]]:
+    """Generate benchmark requests with shared system prompts using random tokens."""
+    # Generate system prompts for each group
+    system_prompts = []
+    for _ in range(num_groups):
+        system_prompt = gen_prompt(tokenizer, system_prompt_len)
+        system_prompts.append(system_prompt)
+
+    # Generate questions
+    questions = []
+    for _ in range(num_groups * prompts_per_group):
+        question = gen_prompt(tokenizer, question_len)
+        questions.append(question)
+
+    # Combine system prompts with questions
+    input_requests = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for group_idx in range(num_groups):
+        system_prompt = system_prompts[group_idx]
+        for prompt_idx in range(prompts_per_group):
+            question = questions[group_idx * prompts_per_group + prompt_idx]
+            full_prompt = f"{system_prompt}\n\n{question}"
+            prompt_len = len(tokenizer.encode(full_prompt))
+
+            input_requests.append((full_prompt, prompt_len, output_len))
+            total_input_tokens += prompt_len
+            total_output_tokens += output_len
+
+    print(f"\nGenerated shared prefix dataset statistics:")
+    print(f"Number of groups: {num_groups}")
+    print(f"Prompts per group: {prompts_per_group}")
+    print(f"Total prompts: {len(input_requests)}")
+    print(f"Total input tokens: {total_input_tokens}")
+    print(f"Total output tokens: {total_output_tokens}")
+    print(
+        f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+    )
+    print(
+        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+    )
+
     return input_requests
 
 
@@ -482,7 +733,7 @@ def calculate_metrics(
             output_len = outputs[i].output_len
             output_lens.append(output_len)
             retokenized_output_len = len(
-                tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids
+                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i][1]
@@ -541,7 +792,7 @@ async def benchmark(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
-    enable_multi: bool,
+    extra_request_body: Dict[str, Any],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -556,6 +807,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
+        extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
@@ -565,6 +817,8 @@ async def benchmark(
         )
     else:
         print("Initial test run completed. Starting main benchmark run...")
+
+    time.sleep(1.5)
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -578,6 +832,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=prompt_len,
             output_len=output_len,
+            extra_request_body=extra_request_body,
         )
         tasks.append(
             asyncio.create_task(
@@ -660,19 +915,20 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
-            "total_input": metrics.total_input,
-            "total_output": metrics.total_output,
-            "total_output_retokenized": metrics.total_output_retokenized,
-            "mean_e2e_latency": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency": metrics.median_e2e_latency_ms,
-            "median_ttft": metrics.median_ttft_ms,
-            "median_itl": metrics.median_itl_ms,
-            "output_token_throughput": metrics.output_throughput,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "output_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            "benchmark_duration": benchmark_duration,
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -742,30 +998,51 @@ def check_chat_template(model_path):
         return False
 
 
-def fire(args: argparse.Namespace):
+def run_benchmark(args_: argparse.Namespace):
+    global args
+    args = args_
+
+    # Set global environments
+    set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    extra_request_body = {}
+    if args.extra_request_body:
+        extra_request_body = json.loads(args.extra_request_body)
+
+    # Set url
     if args.port is None:
         args.port = {
             "sglang": 30000,
+            "sglang-native": 30000,
+            "sglang-oai": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
+            "gserver": 9988,
+            "truss": 8080,
         }.get(args.backend, 30000)
 
-    api_url = (
-        f"{args.base_url}/v1/completions"
-        if args.base_url
-        else f"http://{args.host}:{args.port}/v1/completions"
-    )
     model_url = (
         f"{args.base_url}/v1/models"
         if args.base_url
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend == "trt":
+    if args.backend in ["sglang", "sglang-native"]:
+        api_url = (
+            f"{args.base_url}/generate"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/generate"
+        )
+    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
+        api_url = (
+            f"{args.base_url}/v1/completions"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/completions"
+        )
+    elif args.backend == "trt":
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
             if args.base_url
@@ -774,8 +1051,23 @@ def fire(args: argparse.Namespace):
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
+    elif args.backend == "gserver":
+        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+        args.model = args.model or "default"
+    elif args.backend == "truss":
+        api_url = (
+            f"{args.base_url}/v1/models/model:predict"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/models/model:predict"
+        )
 
+    # Get model name
     if args.model is None:
+        if args.backend == "truss":
+            print(
+                "Please provide a model with `--model` when using truss backend. e.g. --model meta-llama/Llama-3.1-8B-Instruct"
+            )
+            sys.exit(1)
         try:
             response = requests.get(model_url)
             model_list = response.json().get("data", [])
@@ -799,6 +1091,7 @@ def fire(args: argparse.Namespace):
 
     print(f"{args}\n")
 
+    # Read dataset
     backend = args.backend
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
@@ -806,6 +1099,7 @@ def fire(args: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
 
     if args.dataset_name == "sharegpt":
+        assert args.random_input_len is None and args.random_output_len is None
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -813,6 +1107,7 @@ def fire(args: argparse.Namespace):
             fixed_output_len=args.sharegpt_output_len,
         )
     elif args.dataset_name == "random":
+        assert args.random_input_len is not None and args.random_output_len is not None
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -821,10 +1116,33 @@ def fire(args: argparse.Namespace):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
         )
+    elif args.dataset_name == "generated-shared-prefix":
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=args.gen_num_groups,
+            prompts_per_group=args.gen_prompts_per_group,
+            system_prompt_len=args.gen_system_prompt_len,
+            question_len=args.gen_question_len,
+            output_len=args.gen_output_len,
+            tokenizer=tokenizer,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    if args.multi:
+    if not args.multi:
+        return asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                disable_tqdm=args.disable_tqdm,
+                extra_request_body=extra_request_body,
+            )
+        )
+    else:
+        # Benchmark multiple rps. TODO: use a fixed duration to compute num_prompts
         request_rates = parse_request_rate_range(args.request_rate_range)
 
         for rate in request_rates:
@@ -837,25 +1155,11 @@ def fire(args: argparse.Namespace):
                     input_requests=input_requests,
                     request_rate=rate,
                     disable_tqdm=args.disable_tqdm,
-                    enable_multi=args.multi,
+                    extra_request_body=extra_request_body,
                 )
             )
-    else:
-        asyncio.run(
-            benchmark(
-                backend=backend,
-                api_url=api_url,
-                model_id=model_id,
-                tokenizer=tokenizer,
-                input_requests=input_requests,
-                request_rate=args.request_rate,
-                disable_tqdm=args.disable_tqdm,
-                enable_multi=args.multi,
-            )
-        )
 
 
-# to avoid relying on SGLang's components
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
@@ -894,7 +1198,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "generated-shared-prefix"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -925,13 +1229,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-input-len",
         type=int,
-        default=1024,
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         type=int,
-        default=128,
         help="Number of output tokens per request, used only for random dataset.",
     )
     parser.add_argument(
@@ -946,14 +1248,9 @@ if __name__ == "__main__":
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is 128.0.",
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Default is 0.")
-    parser.add_argument(
-        "--disable-tqdm",
-        action="store_true",
-        help="Specify to disable tqdm progress bar.",
-    )
+    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--multi",
         action="store_true",
@@ -967,6 +1264,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
+    parser.add_argument(
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
@@ -976,8 +1278,45 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable ignoring EOS.",
     )
+    parser.add_argument(
+        "--extra-request-body",
+        metavar='{"key1": "value1", "key2": "value2"}',
+        type=str,
+        help="Append given JSON object to the request payload. You can use this to specify"
+        "additional generate params like sampling params.",
+    )
 
-    set_ulimit()
+    group = parser.add_argument_group("generated-shared-prefix dataset arguments")
+    group.add_argument(
+        "--gen-num-groups",
+        type=int,
+        default=64,
+        help="Number of system prompt groups for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-prompts-per-group",
+        type=int,
+        default=16,
+        help="Number of prompts per system prompt group for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-system-prompt-len",
+        type=int,
+        default=2048,
+        help="Target length in tokens for system prompts in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-question-len",
+        type=int,
+        default=128,
+        help="Target length in tokens for questions in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-output-len",
+        type=int,
+        default=256,
+        help="Target length in tokens for outputs in generated-shared-prefix dataset",
+    )
 
     args = parser.parse_args()
-    fire(args)
+    run_benchmark(args)

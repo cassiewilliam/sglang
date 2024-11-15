@@ -16,27 +16,36 @@ limitations under the License.
 """Common utilities."""
 
 import base64
-import fcntl
+import ipaddress
+import json
 import logging
 import os
+import pickle
 import random
+import re
 import resource
+import shutil
+import signal
 import socket
-import struct
+import tempfile
 import time
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import psutil
 import requests
 import torch
 import torch.distributed as dist
-from fastapi.responses import JSONResponse
+import triton
+import zmq
+from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from starlette.middleware.base import BaseHTTPMiddleware
-from torch.nn.parameter import Parameter
+from starlette.routing import Mount
+from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -49,6 +58,27 @@ logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
+
+def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
+    return torch.version.hip is not None
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+    """
+    return torch.cuda.is_available() and not is_hip()
+
+
+def is_ipv6(address):
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ipaddress.AddressValueError:
+        return False
 
 
 def enable_show_time_cost():
@@ -117,26 +147,41 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(gpu_id, distributed=False):
+def get_available_gpu_memory(device, gpu_id, distributed=False):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    num_gpus = torch.cuda.device_count()
-    assert gpu_id < num_gpus
+    if device == "cuda":
+        num_gpus = torch.cuda.device_count()
+        assert gpu_id < num_gpus
 
-    if torch.cuda.current_device() != gpu_id:
-        print(
-            f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-            "which may cause useless memory allocation for torch CUDA context.",
-        )
+        if torch.cuda.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
+                "which may cause useless memory allocation for torch CUDA context.",
+            )
 
-    torch.cuda.empty_cache()
-    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        torch.cuda.empty_cache()
+        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+
+    elif device == "xpu":
+        num_gpus = torch.xpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.xpu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
+                "which may cause useless memory allocation for torch XPU context.",
+            )
+        torch.xpu.empty_cache()
+        used_memory = torch.xpu.memory_allocated()
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device("cuda", gpu_id)
+            torch.device(device, gpu_id)
         )
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
@@ -163,64 +208,6 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
-
-
-def allocate_init_ports(
-    port: Optional[int] = None,
-    additional_ports: Optional[List[int]] = None,
-    dp_size: int = 1,
-):
-    """Allocate ports for all connections."""
-    if additional_ports:
-        ret_ports = [port] + additional_ports
-    else:
-        ret_ports = [port]
-
-    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
-    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
-
-    # HTTP + Tokenizer + Controller + Detokenizer + dp_size * 1 (nccl)
-    num_ports_needed = 4 + dp_size
-    while len(ret_ports) < num_ports_needed:
-        if cur_port not in ret_ports and is_port_available(cur_port):
-            ret_ports.append(cur_port)
-        cur_port += 1
-
-    if port is not None and ret_ports[0] != port:
-        logger.warn(
-            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
-        )
-
-    return ret_ports[0], ret_ports[1:num_ports_needed]
-
-
-def get_int_token_logit_bias(tokenizer, vocab_size):
-    """Get the logit bias for integer-only tokens."""
-    # a bug when model's vocab size > tokenizer.vocab_size
-    vocab_size = tokenizer.vocab_size
-    logit_bias = np.zeros(vocab_size, dtype=np.float32)
-    for t_id in range(vocab_size):
-        ss = tokenizer.decode([t_id]).strip()
-        if not (ss.isdigit() or len(ss) == 0 or t_id == tokenizer.eos_token_id):
-            logit_bias[t_id] = -1e5
-
-    return logit_bias
-
-
-def is_multimodal_model(model):
-    from sglang.srt.model_config import ModelConfig
-
-    if isinstance(model, str):
-        model = model.lower()
-        return "llava" in model or "yi-vl" in model or "llava-next" in model
-
-    if isinstance(model, ModelConfig):
-        model_path = model.path.lower()
-        return (
-            "llava" in model_path or "yi-vl" in model_path or "llava-next" in model_path
-        )
-
-    raise ValueError("unrecognized type")
 
 
 def decode_video_base64(video_base64):
@@ -302,12 +289,14 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file):
+def load_image(image_file: Union[str, bytes]):
     from PIL import Image
 
     image = image_size = None
 
-    if image_file.startswith("http://") or image_file.startswith("https://"):
+    if isinstance(image_file, bytes):
+        image = Image.open(BytesIO(image_file))
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         image = Image.open(BytesIO(response.content))
@@ -319,8 +308,10 @@ def load_image(image_file):
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
-    else:
+    elif isinstance(image_file, str):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
+    else:
+        raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
 
@@ -337,7 +328,11 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -359,29 +354,41 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    children = parent_process.children(recursive=True)
-    for child in children:
-        if child.pid != current_process.pid:
-            os.kill(child.pid, 9)
-    os.kill(parent_process.pid, 9)
-
-
-def kill_child_process(pid, including_parent=True):
+    kill_child_process(
+        parent_process.pid, include_self=True, skip_pid=current_process.pid
+    )
     try:
-        parent = psutil.Process(pid)
+        current_process.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+def kill_child_process(pid=None, include_self=False, skip_pid=None):
+    """Kill the process and all its children process."""
+    if pid is None:
+        pid = os.getpid()
+
+    try:
+        itself = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
 
-    children = parent.children(recursive=True)
+    children = itself.children(recursive=True)
     for child in children:
+        if child.pid == skip_pid:
+            continue
         try:
             child.kill()
         except psutil.NoSuchProcess:
             pass
 
-    if including_parent:
+    if include_self:
         try:
-            parent.kill()
+            itself.kill()
+
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGINT)
         except psutil.NoSuchProcess:
             pass
 
@@ -408,7 +415,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         DummyModelLoader,
         LoRAConfig,
         ModelConfig,
-        MultiModalConfig,
         ParallelConfig,
         SchedulerConfig,
         _initialize_model,
@@ -423,7 +429,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         model_config: ModelConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
-        multimodal_config: Optional[MultiModalConfig],
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
@@ -434,7 +439,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                     model_config,
                     self.load_config,
                     lora_config,
-                    multimodal_config,
                     cache_config,
                 )
 
@@ -442,10 +446,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
-                # FIXME: Remove this after Mixtral is updated
-                # to use quant_method.
-                if hasattr(module, "process_weights_after_loading"):
-                    module.process_weights_after_loading()
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -539,102 +539,6 @@ class CustomCacheManager(FileCacheManager):
                 raise RuntimeError("Could not create or locate cache dir")
 
 
-def get_ip_address(ifname):
-    """
-    Get the IP address of a network interface.
-
-    :param ifname: Name of the network interface (e.g., 'eth0')
-    :return: IP address of the network interface
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ip_address = fcntl.ioctl(
-        s.fileno(),
-        0x8915,  # SIOCGIFADDR
-        struct.pack("256s", bytes(ifname[:15], "utf-8")),
-    )[20:24]
-    return socket.inet_ntoa(ip_address)
-
-
-def send_addrs_to_rank_0(model_port_args, server_args):
-    assert server_args.node_rank != 0 and server_args.dp_size == 1
-
-    ifname = os.environ.get(
-        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
-    )
-    ip_addr = get_ip_address(ifname)
-
-    num_tp_ports = server_args.tp_size // server_args.nnodes
-    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
-    ip_addr = [int(x) for x in ip_addr.split(".")]
-    addrs_tensor = torch.tensor(
-        ip_addr + model_port_args.model_tp_ports, dtype=torch.int
-    )
-
-    init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(
-        backend="gloo",
-        init_method=init_method,
-        rank=server_args.node_rank,
-        world_size=server_args.nnodes,
-    )
-    dist.send(addrs_tensor, dst=0)
-    print(
-        f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}"
-    )
-
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def receive_addrs(model_port_args, server_args):
-    assert server_args.node_rank == 0 and server_args.dp_size == 1
-
-    ifname = os.environ.get(
-        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
-    )
-    ip_addr = get_ip_address(ifname)
-
-    num_tp_ports = server_args.tp_size // server_args.nnodes
-    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
-
-    init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(
-        backend="gloo",
-        init_method=init_method,
-        rank=server_args.node_rank,
-        world_size=server_args.nnodes,
-    )
-
-    for src_rank in range(1, server_args.nnodes):
-        tensor = torch.zeros(4 + num_tp_ports, dtype=torch.int)
-        dist.recv(tensor, src=src_rank)
-        ip = ".".join([str(x) for x in tensor[:4].tolist()])
-        ports = tensor[4:].tolist()
-        model_port_args.model_tp_ips[
-            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
-        ] = [ip] * num_tp_ports
-        model_port_args.model_tp_ports[
-            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
-        ] = ports
-        print(f"Node 0 received from rank {src_rank}: {tensor.tolist()}")
-
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def set_torch_compile_config():
-    # The following configurations are for torch compile optimizations
-    import torch._dynamo.config
-    import torch._inductor.config
-
-    torch._inductor.config.coordinate_descent_tuning = True
-    torch._inductor.config.triton.unique_kernel_names = True
-    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
-
-    # FIXME: tmp workaround
-    torch._dynamo.config.accumulated_cache_size_limit = 256
-
-
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
@@ -643,59 +547,10 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
+            logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
-def is_llama3_405b_fp8(model_config):
-    """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
-    if (
-        model_config.hf_config.architectures[0] == "LlamaForCausalLM"
-        and model_config.hf_config.hidden_size == 16384
-        and model_config.hf_config.intermediate_size == 53248
-        and model_config.hf_config.num_hidden_layers == 126
-        and model_config.hf_config.num_key_value_heads == 16
-        and hasattr(model_config.hf_config, "quantization_config")
-        and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
-    ):
-        return True
-    return False
-
-
-def monkey_patch_vllm_qvk_linear_loader():
-    """A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints."""
-    from vllm.model_executor.layers.linear import QKVParallelLinear
-
-    origin_weight_loader = QKVParallelLinear.weight_loader
-
-    def get_original_weight(loaded_weight, head_dim):
-        n_kv_head = loaded_weight.shape[0] // (2 * head_dim)
-        dim = loaded_weight.shape[1]
-        for i in range(n_kv_head):
-            loaded_weight[i * head_dim : (i + 1) * head_dim, :] = loaded_weight[
-                2 * i * head_dim : (2 * i + 1) * head_dim, :
-            ]
-        original_kv_weight = loaded_weight[: n_kv_head * head_dim, :]
-        assert original_kv_weight.shape == (n_kv_head * head_dim, dim)
-        return original_kv_weight
-
-    def weight_loader_srt(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[str] = None,
-    ):
-        if (
-            loaded_shard_id in ["k", "v"]
-            and loaded_weight.shape[0] == self.head_size * self.total_num_kv_heads * 2
-        ):
-            loaded_weight = get_original_weight(loaded_weight, self.head_size)
-
-        origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
-
-    setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
-
-
-def add_api_key_middleware(app, api_key):
+def add_api_key_middleware(app, api_key: str):
     @app.middleware("http")
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
@@ -703,5 +558,236 @@ def add_api_key_middleware(app, api_key):
         if request.url.path.startswith("/health"):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
-            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            model_path = snapshot_download(model_path)
+            tokenizer_path = snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return model_path, tokenizer_path
+
+
+def configure_logger(server_args, prefix: str = ""):
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format=format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+# source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
+def replace_submodule(
+    model: nn.Module, module_name: str, new_module: nn.Module
+) -> nn.Module:
+    """Replace a submodule in a model with a new module."""
+    parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
+    target_name = module_name.split(".")[-1]
+    setattr(parent, target_name, new_module)
+    return new_module
+
+
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        setattr(weight, key, value)
+
+
+def broadcast_pyobj(
+    data: List[Any],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+
+    if rank == 0:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_data, src=0, group=dist_group)
+        return data
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.broadcast(tensor_size, src=0, group=dist_group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.broadcast(tensor_data, src=0, group=dist_group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+
+step_counter = 0
+
+
+def pytorch_profile(name, func, *args, data_size=-1):
+    """
+    Args:
+        name (string): the name of recorded function.
+        func: the function to be profiled.
+        args: the arguments of the profiled function.
+        data_size (int): some measurement of the computation complexity.
+            Usually, it could be the batch size.
+    """
+    global step_counter
+    os.makedirs("trace", exist_ok=True)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with record_function(name):
+            with open(f"trace/size_{step_counter}.json", "w") as f:
+                json.dump({"size": data_size}, f)
+            result = func(*args)
+    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
+    step_counter += 1
+    return result
+
+
+def first_rank_print(*args, **kwargs):
+    if torch.cuda.current_device() == 0:
+        print(*args, **kwargs)
+    else:
+        pass
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if socket_type == zmq.PUSH:
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+        socket.connect(f"ipc://{endpoint}")
+    elif socket_type == zmq.PULL:
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+        socket.bind(f"ipc://{endpoint}")
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    return socket
+
+
+def dump_to_file(dirpath, name, value):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    os.makedirs(dirpath, exist_ok=True)
+    if value.dtype is torch.bfloat16:
+        value = value.float()
+    value = value.cpu().numpy()
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
+    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
+    np.save(output_filename, value)
+
+
+def is_triton_3():
+    return triton.__version__.startswith("3.")
+
+
+def maybe_torch_compile(*args, **kwargs):
+    """
+    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
+    Therefore, we disable it here.
+    """
+
+    def decorator(func):
+        if is_triton_3():
+            return torch.compile(*args, **kwargs)(func)
+        return func
+
+    return decorator
+
+
+def delete_directory(dirpath):
+    try:
+        # This will remove the directory and all its contents
+        shutil.rmtree(dirpath)
+    except OSError as e:
+        print(f"Warning: {dirpath} : {e.strerror}")
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)

@@ -1,6 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 
 class ChatTemplateStyle(Enum):
@@ -116,6 +116,23 @@ register_chat_template(
     )
 )
 
+
+register_chat_template(
+    ChatTemplate(
+        name="chatml-llava",
+        default_system_prompt="You are a helpful assistant.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=("<|im_end|>",),
+        image_token="<image>\n",
+    )
+)
+
+
 # There is default system prompt for qwen
 # reference: https://modelscope.cn/models/qwen/Qwen2-72B-Instruct/file/view/master?fileName=tokenizer_config.json&status=1
 # The chat template is: "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
@@ -133,11 +150,11 @@ register_chat_template(
     )
 )
 
-
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_chat_template(
     ChatTemplate(
-        name="chatml-llava",
-        default_system_prompt="Answer the questions.",
+        name="qwen2-vl",
+        default_system_prompt="You are a helpful assistant.",
         role_prefix_and_suffix={
             "system": ("<|im_start|>system\n", "<|im_end|>\n"),
             "user": ("<|im_start|>user\n", "<|im_end|>\n"),
@@ -145,7 +162,7 @@ register_chat_template(
         },
         style=ChatTemplateStyle.PLAIN,
         stop_str=("<|im_end|>",),
-        image_token=" <image>\n",
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
     )
 )
 
@@ -163,21 +180,6 @@ register_chat_template(
             "assistant": ("ASSISTANT:", "</s>"),
         },
         image_token=" <image>\n",
-    )
-)
-
-# Reference: https://modelscope.cn/models/01ai/Yi-1.5-34B-Chat/file/view/master?fileName=tokenizer_config.json&status=1
-register_chat_template(
-    ChatTemplate(
-        name="yi-1.5",
-        default_system_prompt=None,
-        role_prefix_and_suffix={
-            "system": ("", ""),
-            "user": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
-            "assistant": ("", "<|im_end|>\n"),
-        },
-        style=ChatTemplateStyle.PLAIN,
-        stop_str=("<|im_end|>",),
     )
 )
 
@@ -213,6 +215,46 @@ register_chat_template(
             ),
         },
         stop_str=("<|eot_id|>",),
+        image_token="<|image|>",
+    )
+)
+
+# The difference between "llama-3-instruct-llava" and "llama-3-instruct" is that llava uses a different image_token.
+register_chat_template(
+    ChatTemplate(
+        name="llama-3-instruct-llava",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|start_header_id|>system<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "user": (
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "assistant": (
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+        },
+        stop_str=("<|eot_id|>",),
+        image_token="<image>\n",
+    )
+)
+
+# Reference: https://modelscope.cn/models/01ai/Yi-1.5-34B-Chat/file/view/master?fileName=tokenizer_config.json&status=1
+register_chat_template(
+    ChatTemplate(
+        name="yi-1.5",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", ""),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
+            "assistant": ("", "<|im_end|>\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=("<|im_end|>",),
     )
 )
 
@@ -322,12 +364,17 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
-    if "qwen" in model_path and ("chat" in model_path or "instruct" in model_path):
+    if (
+        "qwen" in model_path
+        and ("chat" in model_path or "instruct" in model_path)
+        and ("llava" not in model_path)
+    ):
         return get_chat_template("qwen")
     if (
         "llava-v1.6-34b" in model_path
         or "llava-v1.6-yi-34b" in model_path
         or "llava-next-video-34b" in model_path
+        or "llava-onevision-qwen2" in model_path
     ):
         return get_chat_template("chatml-llava")
 
